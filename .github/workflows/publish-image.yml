@@ -56,24 +56,55 @@ jobs:
           mkdir image-context
           cp Dockerfile entrypoint.sh image-context/
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir image-context \
-            --pattern deemedia-link-linux-amd64 --pattern deemedia-link-linux-arm64 --pattern SHA256SUMS
+            --pattern deemedia-link-linux-amd64 --pattern deemedia-link-linux-arm64 \
+            --pattern deemedia-link-windows-amd64.exe --pattern deemedia-link-windows-arm64.exe \
+            --pattern deemedia-link-darwin-amd64 --pattern deemedia-link-darwin-arm64 \
+            --pattern FFmpeg-8.0.1-source.tar.xz --pattern FFmpeg-LGPL-2.1.txt \
+            --pattern build-ffprobe.sh --pattern check-ffprobe-binary.py --pattern SHA256SUMS
           cd image-context
           python3 - <<'PY'
           import re
           lines = open('SHA256SUMS', encoding='ascii').read().splitlines()
-          expected = {'deemedia-link-linux-amd64', 'deemedia-link-linux-arm64'}
+          expected = {
+              'deemedia-link-linux-amd64', 'deemedia-link-linux-arm64',
+              'deemedia-link-windows-amd64.exe', 'deemedia-link-windows-arm64.exe',
+              'deemedia-link-darwin-amd64', 'deemedia-link-darwin-arm64',
+              'FFmpeg-8.0.1-source.tar.xz', 'FFmpeg-LGPL-2.1.txt',
+              'build-ffprobe.sh', 'check-ffprobe-binary.py',
+          }
           found = set()
           for line in lines:
-              match = re.fullmatch(r'[0-9a-fA-F]{64} [ *](deemedia-link-linux-(?:amd64|arm64))', line)
-              if not match or match.group(1) in found:
+              match = re.fullmatch(r'[0-9a-fA-F]{64} [ *]([A-Za-z0-9_.-]+)', line)
+              if not match or match.group(1) not in expected or match.group(1) in found:
                   raise SystemExit('Invalid SHA256SUMS')
               found.add(match.group(1))
           if found != expected:
-              raise SystemExit('SHA256SUMS must contain exactly both binaries')
+              raise SystemExit('SHA256SUMS must contain exactly the six binaries and FFmpeg source materials')
           PY
           sha256sum --check --strict SHA256SUMS
+          printf '%s  %s\n' '05ee0b03119b45c0bdb4df654b96802e909e0a752f72e4fe3794f487229e5a41' 'FFmpeg-8.0.1-source.tar.xz' | sha256sum --check --strict
           readelf -h deemedia-link-linux-amd64 | grep -Eq 'Machine:.*Advanced Micro Devices X86-64'
           readelf -h deemedia-link-linux-arm64 | grep -Eq 'Machine:.*AArch64'
+          python3 - <<'PY'
+          import struct
+          for arch, machine in [('amd64', 0x8664), ('arm64', 0xaa64)]:
+              with open(f'deemedia-link-windows-{arch}.exe', 'rb') as f:
+                  header = f.read(64)
+                  if header[:2] != b'MZ':
+                      raise SystemExit('Invalid Windows executable')
+                  f.seek(struct.unpack_from('<I', header, 60)[0])
+                  pe = f.read(6)
+                  if pe[:4] != b'PE\0\0' or struct.unpack_from('<H', pe, 4)[0] != machine:
+                      raise SystemExit('Windows executable architecture mismatch')
+          for arch, cpu in [('amd64', 0x01000007), ('arm64', 0x0100000c)]:
+              with open(f'deemedia-link-darwin-{arch}', 'rb') as f:
+                  header = f.read(8)
+              if header[:4] != b'\xcf\xfa\xed\xfe' or struct.unpack_from('<I', header, 4)[0] != cpu:
+                  raise SystemExit('macOS executable architecture mismatch')
+          PY
+          # Only the two Linux binaries are needed as Docker build context.
+          rm -f deemedia-link-windows-*.exe deemedia-link-darwin-* FFmpeg-8.0.1-source.tar.xz \
+            FFmpeg-LGPL-2.1.txt build-ffprobe.sh check-ffprobe-binary.py SHA256SUMS
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -103,6 +134,10 @@ jobs:
             exit 1
           }
           jq -e '[.manifests[]?.platform | select(.os == "linux") | .architecture] | (index("amd64") != null and index("arm64") != null)' /tmp/image-index.json >/dev/null
+
+      - name: Smoke-test both images and record their sizes
+        shell: bash
+        run: ./tests/smoke-image.sh "$IMAGE" "$TAG" "$GITHUB_STEP_SUMMARY"
 
       - uses: docker/login-action@v3
         with:
