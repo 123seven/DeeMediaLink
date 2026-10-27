@@ -93,7 +93,8 @@ jobs:
             echo '2.0.0 already exists; refusing to overwrite it.' >&2
             exit 1
           fi
-          if ! grep -Eqi 'manifest unknown|manifest_unknown|manifest[^[:cntrl:]]*not found' /tmp/existing-image.txt; then
+          if ! grep -Eqi 'manifest unknown|manifest_unknown|manifest[^[:cntrl:]]*not found' /tmp/existing-image.txt &&
+             ! grep -Fxq "ERROR: $IMAGE:2.0.0: not found" /tmp/existing-image.txt; then
             cat /tmp/existing-image.txt >&2
             echo 'Could not prove the 2.0.0 tag is absent; refusing to write it.' >&2
             exit 1
