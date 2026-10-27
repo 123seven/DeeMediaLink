@@ -70,6 +70,7 @@ jobs:
           context: ./image-context
           platforms: linux/amd64,linux/arm64
           push: true
+          provenance: false
           tags: crpi-2px6rtvkdjv8fx9b.cn-chengdu.personal.cr.aliyuncs.com/feifeiduck/deemedia-link:mirror-2.0.0-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Verify anonymous image index
         shell: bash
