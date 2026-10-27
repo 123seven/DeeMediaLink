@@ -1,0 +1,110 @@
+name: Publish DeeMedia Link image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: deemedia-link-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      IMAGE: ghcr.io/123seven/deemedia-link
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Validate release
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REPOSITORY,,}" == 123seven/deemedialink ]] || { echo 'Unexpected release repository' >&2; exit 1; }
+          [[ "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" ]] || { echo 'Run from the default branch' >&2; exit 1; }
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Invalid release tag' >&2; exit 1; }
+          release=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,tagName)
+          jq -e --arg tag "$TAG" '.isDraft and (.isPrerelease | not) and .tagName == $tag' <<< "$release" >/dev/null
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,isDraft,isPrerelease > /tmp/releases.json
+          python3 - <<'PY'
+          import json, os, re
+          version = tuple(map(int, os.environ['TAG'][1:].split('.')))
+          for release in json.load(open('/tmp/releases.json')):
+              tag = release['tagName']
+              if not release['isDraft'] and not release['isPrerelease'] and re.fullmatch(r'v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
+                  if tuple(map(int, tag.removeprefix('v').split('.'))) >= version:
+                      raise SystemExit('Refusing to move latest to an older or already published version')
+          PY
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download and verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir image-context
+          cp Dockerfile entrypoint.sh image-context/
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir image-context \
+            --pattern deemedia-link-linux-amd64 --pattern deemedia-link-linux-arm64 --pattern SHA256SUMS
+          cd image-context
+          python3 - <<'PY'
+          import re
+          lines = open('SHA256SUMS', encoding='ascii').read().splitlines()
+          expected = {'deemedia-link-linux-amd64', 'deemedia-link-linux-arm64'}
+          found = set()
+          for line in lines:
+              match = re.fullmatch(r'[0-9a-fA-F]{64} [ *](deemedia-link-linux-(?:amd64|arm64))', line)
+              if not match or match.group(1) in found:
+                  raise SystemExit('Invalid SHA256SUMS')
+              found.add(match.group(1))
+          if found != expected:
+              raise SystemExit('SHA256SUMS must contain exactly both binaries')
+          PY
+          sha256sum --check --strict SHA256SUMS
+          readelf -h deemedia-link-linux-amd64 | grep -Eq 'Machine:.*Advanced Micro Devices X86-64'
+          readelf -h deemedia-link-linux-arm64 | grep -Eq 'Machine:.*AArch64'
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push multi-architecture image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./image-context
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/123seven/deemedia-link:${{ inputs.tag }}
+
+      - name: Verify anonymous image pull
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${TAG#v}
+          token=$(curl -fsSL 'https://ghcr.io/token?service=ghcr.io&scope=repository:123seven/deemedia-link:pull' | jq -er .token)
+          curl -fsSI -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/123seven/deemedia-link/manifests/$TAG" >/dev/null || {
+              echo 'GHCR package is not publicly pullable. Set the package visibility to public and rerun this workflow.' >&2
+              exit 1
+            }
+          docker buildx imagetools create --tag "$IMAGE:$version" --tag "$IMAGE:latest" "$IMAGE:$TAG"
+
+      - name: Publish GitHub release
+        shell: bash
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
