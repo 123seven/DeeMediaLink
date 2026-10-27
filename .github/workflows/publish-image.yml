@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Draft release tag (vMAJOR.MINOR.PATCH)
+        description: Release tag (vMAJOR.MINOR.PATCH)
         required: true
         type: string
+      replace_existing:
+        description: Rebuild an existing published release using its current assets
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -21,6 +26,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag }}
+      REPLACE_EXISTING: ${{ inputs.replace_existing }}
       REGISTRY: crpi-2px6rtvkdjv8fx9b.cn-chengdu.personal.cr.aliyuncs.com
       IMAGE: crpi-2px6rtvkdjv8fx9b.cn-chengdu.personal.cr.aliyuncs.com/feifeiduck/deemedia-link
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -33,7 +39,13 @@ jobs:
           [[ "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" ]] || { echo 'Run from the default branch' >&2; exit 1; }
           [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Invalid release tag' >&2; exit 1; }
           release=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,tagName)
-          jq -e --arg tag "$TAG" '.isDraft and (.isPrerelease | not) and .tagName == $tag' <<< "$release" >/dev/null
+          if [[ "$REPLACE_EXISTING" == true ]]; then
+            jq -e --arg tag "$TAG" '(.isDraft | not) and (.isPrerelease | not) and .tagName == $tag' <<< "$release" >/dev/null
+            echo "IMAGE_TAG=rebuild-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          else
+            jq -e --arg tag "$TAG" '.isDraft and (.isPrerelease | not) and .tagName == $tag' <<< "$release" >/dev/null
+            echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+          fi
           gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,isDraft,isPrerelease > /tmp/releases.json
           python3 - <<'PY'
           import json, os, re
@@ -41,7 +53,9 @@ jobs:
           for release in json.load(open('/tmp/releases.json')):
               tag = release['tagName']
               if not release['isDraft'] and not release['isPrerelease'] and re.fullmatch(r'v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
-                  if tuple(map(int, tag.removeprefix('v').split('.'))) >= version:
+                  existing = tuple(map(int, tag.removeprefix('v').split('.')))
+                  same_release = os.environ['REPLACE_EXISTING'] == 'true' and tag == os.environ['TAG']
+                  if existing > version or (existing == version and not same_release):
                       raise SystemExit('Refusing to move latest to an older or already published version')
           PY
 
@@ -59,8 +73,7 @@ jobs:
             --pattern deemedia-link-linux-amd64 --pattern deemedia-link-linux-arm64 \
             --pattern deemedia-link-windows-amd64.exe --pattern deemedia-link-windows-arm64.exe \
             --pattern deemedia-link-darwin-amd64 --pattern deemedia-link-darwin-arm64 \
-            --pattern FFmpeg-8.0.1-source.tar.xz --pattern FFmpeg-LGPL-2.1.txt \
-            --pattern build-ffprobe.sh --pattern check-ffprobe-binary.py --pattern SHA256SUMS
+            --pattern FFmpeg-8.0.1-source-materials.tar.gz --pattern SHA256SUMS
           cd image-context
           python3 - <<'PY'
           import re
@@ -69,8 +82,7 @@ jobs:
               'deemedia-link-linux-amd64', 'deemedia-link-linux-arm64',
               'deemedia-link-windows-amd64.exe', 'deemedia-link-windows-arm64.exe',
               'deemedia-link-darwin-amd64', 'deemedia-link-darwin-arm64',
-              'FFmpeg-8.0.1-source.tar.xz', 'FFmpeg-LGPL-2.1.txt',
-              'build-ffprobe.sh', 'check-ffprobe-binary.py',
+              'FFmpeg-8.0.1-source-materials.tar.gz',
           }
           found = set()
           for line in lines:
@@ -82,7 +94,21 @@ jobs:
               raise SystemExit('SHA256SUMS must contain exactly the six binaries and FFmpeg source materials')
           PY
           sha256sum --check --strict SHA256SUMS
-          printf '%s  %s\n' '05ee0b03119b45c0bdb4df654b96802e909e0a752f72e4fe3794f487229e5a41' 'FFmpeg-8.0.1-source.tar.xz' | sha256sum --check --strict
+          python3 - <<'PY'
+          import hashlib, tarfile
+          expected = {'FFmpeg-8.0.1-source.tar.xz', 'FFmpeg-LGPL-2.1.txt',
+                      'build-ffprobe.sh', 'check-ffprobe-binary.py', 'README.txt'}
+          with tarfile.open('FFmpeg-8.0.1-source-materials.tar.gz', 'r:gz') as archive:
+              members = archive.getmembers()
+              if len(members) != len(expected) or {member.name for member in members} != expected:
+                  raise SystemExit('Invalid FFmpeg source materials archive')
+              if any(not member.isfile() or member.size == 0 for member in members):
+                  raise SystemExit('FFmpeg source materials must contain nonempty regular files')
+              source = archive.extractfile('FFmpeg-8.0.1-source.tar.xz')
+              digest = hashlib.file_digest(source, 'sha256').hexdigest()
+              if digest != '05ee0b03119b45c0bdb4df654b96802e909e0a752f72e4fe3794f487229e5a41':
+                  raise SystemExit('FFmpeg source archive checksum mismatch')
+          PY
           readelf -h deemedia-link-linux-amd64 | grep -Eq 'Machine:.*Advanced Micro Devices X86-64'
           readelf -h deemedia-link-linux-arm64 | grep -Eq 'Machine:.*AArch64'
           python3 - <<'PY'
@@ -103,8 +129,7 @@ jobs:
                   raise SystemExit('macOS executable architecture mismatch')
           PY
           # Only the two Linux binaries are needed as Docker build context.
-          rm -f deemedia-link-windows-*.exe deemedia-link-darwin-* FFmpeg-8.0.1-source.tar.xz \
-            FFmpeg-LGPL-2.1.txt build-ffprobe.sh check-ffprobe-binary.py SHA256SUMS
+          rm -f deemedia-link-windows-*.exe deemedia-link-darwin-* FFmpeg-8.0.1-source-materials.tar.gz SHA256SUMS
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -121,7 +146,7 @@ jobs:
           push: true
           provenance: false
           tags: |
-            crpi-2px6rtvkdjv8fx9b.cn-chengdu.personal.cr.aliyuncs.com/feifeiduck/deemedia-link:${{ inputs.tag }}
+            crpi-2px6rtvkdjv8fx9b.cn-chengdu.personal.cr.aliyuncs.com/feifeiduck/deemedia-link:${{ env.IMAGE_TAG }}
 
       - name: Verify anonymous image pull
         shell: bash
@@ -129,7 +154,7 @@ jobs:
           set -euo pipefail
           # Remove push credentials before inspecting, so a private repository cannot pass.
           docker logout "$REGISTRY"
-          docker buildx imagetools inspect --raw "$IMAGE:$TAG" > /tmp/image-index.json || {
+          docker buildx imagetools inspect --raw "$IMAGE:$IMAGE_TAG" > /tmp/image-index.json || {
             echo 'Image is not publicly pullable. Set the repository visibility to public and rerun this workflow.' >&2
             exit 1
           }
@@ -137,7 +162,7 @@ jobs:
 
       - name: Smoke-test both images and record their sizes
         shell: bash
-        run: ./tests/smoke-image.sh "$IMAGE" "$TAG" "$GITHUB_STEP_SUMMARY"
+        run: ./tests/smoke-image.sh "$IMAGE" "$IMAGE_TAG" "$GITHUB_STEP_SUMMARY" "$TAG"
 
       - uses: docker/login-action@v3
         with:
@@ -148,9 +173,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # A newer release may have been published while the image was built.
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,isDraft,isPrerelease > /tmp/releases.json
+          python3 - <<'PY'
+          import json, os, re
+          version = tuple(map(int, os.environ['TAG'][1:].split('.')))
+          for release in json.load(open('/tmp/releases.json')):
+              tag = release['tagName']
+              if not release['isDraft'] and not release['isPrerelease'] and re.fullmatch(r'v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
+                  existing = tuple(map(int, tag.removeprefix('v').split('.')))
+                  same_release = os.environ['REPLACE_EXISTING'] == 'true' and tag == os.environ['TAG']
+                  if existing > version or (existing == version and not same_release):
+                      raise SystemExit('Refusing to move latest to an older or already published version')
+          PY
           version=${TAG#v}
-          docker buildx imagetools create --tag "$IMAGE:$version" --tag "$IMAGE:latest" "$IMAGE:$TAG"
+          if [[ "$REPLACE_EXISTING" == true ]]; then
+            docker buildx imagetools create --tag "$IMAGE:$TAG" --tag "$IMAGE:$version" --tag "$IMAGE:latest" "$IMAGE:$IMAGE_TAG"
+          else
+            docker buildx imagetools create --tag "$IMAGE:$version" --tag "$IMAGE:latest" "$IMAGE:$IMAGE_TAG"
+          fi
 
       - name: Publish GitHub release
+        if: ${{ !inputs.replace_existing }}
         shell: bash
         run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

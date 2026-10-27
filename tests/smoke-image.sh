@@ -3,18 +3,22 @@
 # release becomes public. The only test media is the synthetic local fixture.
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo 'Usage: smoke-image.sh IMAGE_REPOSITORY RELEASE_TAG [SUMMARY_FILE]' >&2
+if [[ $# -lt 2 || $# -gt 4 ]]; then
+  echo 'Usage: smoke-image.sh IMAGE_REPOSITORY IMAGE_TAG [SUMMARY_FILE [VERSION_TAG]]' >&2
   exit 2
 fi
 repository=$1
 tag=$2
 summary=${3:-}
-[[ $tag =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+version_tag=${4:-$tag}
+[[ $tag =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || {
+  echo 'Invalid image tag' >&2; exit 2;
+}
+[[ $version_tag =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
   echo 'Invalid release tag' >&2; exit 2;
 }
 image="$repository:$tag"
-expected_version=${tag#v}
+expected_version=${version_tag#v}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 fixture_dir="$script_dir/fixtures"
 [[ -r "$fixture_dir/sample.mp4" ]] || { echo 'Missing synthetic fixture' >&2; exit 1; }

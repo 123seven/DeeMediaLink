@@ -2,7 +2,6 @@
 # The deployed image is authoritative. Legacy /data/current files are ignored.
 set -u
 umask 077
-if [ -n "${DEEMEDIA_LINK_MEDIA_DIR:-}" ]; then export NAS_MEDIA_DIR="$DEEMEDIA_LINK_MEDIA_DIR"; fi
 child_pid=
 shutdown() {
   if [ -n "$child_pid" ]; then
